@@ -21,3 +21,10 @@
 
 ### Disclaimer
 - This code might not work for devices running on a CPU with ARM architecture. 
+
+### Screenshots
+- make in terminal
+  ![Screenshot from 2025-01-19 12-49-46](https://github.com/user-attachments/assets/1b1ef5a6-536b-4dae-8c1d-88403ce85648)
+
+- OS (Start Screen)
+  ![Screenshot from 2025-01-19 13-28-29](https://github.com/user-attachments/assets/47599b59-b936-4964-8b78-0f9ffbb7f806)
