@@ -1,383 +1,277 @@
-#include <drivers/amd_am79c973.h>
+#include <drivers/ata.h>
 
 /*
- * Namespace usage for clarity: 
- *  - myos: main OS namespace
- *  - common: contains fundamental types (uint8_t, uint32_t, etc.)
- *  - drivers: contains driver-related classes (e.g., amd_am79c973)
- *  - hardwarecommunication: contains hardware I/O and interrupt-related classes
+ * Use of namespaces:
+ *   - myos is the root namespace for the operating system.
+ *   - myos::common provides basic type definitions (uint8_t, uint16_t, etc.).
+ *   - myos::drivers houses driver-related classes, including ATA driver here.
  */
 using namespace myos;
 using namespace myos::common;
 using namespace myos::drivers;
-using namespace myos::hardwarecommunication;
-
 
 /*
- * ----------------------------------
- * RawDataHandler Class Definitions
- * ----------------------------------
+ * External functions for printing:
+ *   - printf: prints a string.
+ *   - printfHex: prints a byte in hexadecimal format.
+ * These are commonly defined elsewhere in the OS (e.g., in a console or debugging library).
  */
-
-/*
- * Constructor:
- *  - Associates this RawDataHandler with a specific amd_am79c973 device.
- *  - Sets this handler in the NIC driver, so the driver knows to forward raw data to this handler.
- */
-RawDataHandler::RawDataHandler(amd_am79c973* backend)
-{
-    this->backend = backend;
-    backend->SetHandler(this);
-}
-
-/*
- * Destructor:
- *  - Detaches this handler from the NIC driver by setting the driver’s handler to null (0).
- */
-RawDataHandler::~RawDataHandler()
-{
-    backend->SetHandler(0);
-}
-            
-/*
- * OnRawDataReceived:
- *  - Called by the NIC driver whenever raw data is received.
- *  - Returns a boolean indicating if the data was processed (default false here).
- *  - Derived or extended handlers can override this to process incoming packets.
- */
-bool RawDataHandler::OnRawDataReceived(uint8_t* buffer, uint32_t size)
-{
-    return false;
-}
-
-/*
- * Send:
- *  - Forwards data to the NIC driver for transmission.
- *  - The size parameter is the length of the buffer in bytes.
- */
-void RawDataHandler::Send(uint8_t* buffer, uint32_t size)
-{
-    backend->Send(buffer, size);
-}
-
-
-/*
- * External C-style functions (likely from other parts of the OS):
- *  - printf: prints a string to the console.
- *  - printfHex: prints a byte in hexadecimal format.
- */
-extern void printf(char*);
+extern void printf(char* str);
 extern void printfHex(uint8_t);
 
 
 /*
- * ----------------------------------
- * amd_am79c973 Class Definitions
- * ----------------------------------
+ * AdvancedTechnologyAttachment class implements an ATA (IDE) driver for reading/writing data 
+ * from/to an ATA hard disk or similar storage device using 28-bit addressing.
  */
-
+ 
 /*
  * Constructor:
- *  - Initializes the amd_am79c973 driver based on information in the PCI descriptor 'dev',
- *    and sets up interrupt handling via 'interrupts'.
- *  - Maps I/O ports used by the NIC (MACAddress0Port, registerDataPort, etc.).
- *  - Reads and composes the MAC address from hardware.
- *  - Sets up the Initialization Block (initBlock) and configures send/receive buffers.
+ *   - master: boolean indicating if the drive is the master or slave on this ATA channel.
+ *   - portBase: the base I/O port for the ATA channel (e.g., 0x1F0 for primary, 0x170 for secondary).
+ *   It initializes I/O port objects for data, error, sector count, LBA registers, and command/control.
  */
-amd_am79c973::amd_am79c973(PeripheralComponentInterconnectDeviceDescriptor *dev,
-                           InterruptManager* interrupts)
-:   Driver(),
-    InterruptHandler(interrupts, dev->interrupt + interrupts->HardwareInterruptOffset()),
-    MACAddress0Port(dev->portBase),
-    MACAddress2Port(dev->portBase + 0x02),
-    MACAddress4Port(dev->portBase + 0x04),
-    registerDataPort(dev->portBase + 0x10),
-    registerAddressPort(dev->portBase + 0x12),
-    resetPort(dev->portBase + 0x14),
-    busControlRegisterDataPort(dev->portBase + 0x16)
+AdvancedTechnologyAttachment::AdvancedTechnologyAttachment(bool master, common::uint16_t portBase)
+:   dataPort(portBase),
+    errorPort(portBase + 0x1),
+    sectorCountPort(portBase + 0x2),
+    lbaLowPort(portBase + 0x3),
+    lbaMidPort(portBase + 0x4),
+    lbaHiPort(portBase + 0x5),
+    devicePort(portBase + 0x6),
+    commandPort(portBase + 0x7),
+    controlPort(portBase + 0x206)
 {
-    this->handler = 0;               // No handler initially set
-    currentSendBuffer = 0;
-    currentRecvBuffer = 0;
-    
-    // Read the MAC address from the hardware ports
-    uint64_t MAC0 = MACAddress0Port.Read() % 256;   // Lower byte of MACAddress0
-    uint64_t MAC1 = MACAddress0Port.Read() / 256;   // Upper byte of MACAddress0
-    uint64_t MAC2 = MACAddress2Port.Read() % 256;   // Lower byte of MACAddress2
-    uint64_t MAC3 = MACAddress2Port.Read() / 256;   // Upper byte of MACAddress2
-    uint64_t MAC4 = MACAddress4Port.Read() % 256;   // Lower byte of MACAddress4
-    uint64_t MAC5 = MACAddress4Port.Read() / 256;   // Upper byte of MACAddress4
-    
-    // Combine into a 48-bit MAC (stored in a 64-bit container)
-    uint64_t MAC = (MAC5 << 40)
-                 | (MAC4 << 32)
-                 | (MAC3 << 24)
-                 | (MAC2 << 16)
-                 | (MAC1 << 8)
-                 | (MAC0);
-    
-    // Set 32-bit mode via the bus control register (Register #20)
-    registerAddressPort.Write(20);
-    busControlRegisterDataPort.Write(0x102);
-    
-    // Stop/reset the card (Register #0, write 0x04 = STOP)
-    registerAddressPort.Write(0);
-    registerDataPort.Write(0x04);
-    
-    // Prepare the Initialization Block
-    initBlock.mode       = 0x0000;   // Normal mode (non-promiscuous)
-    initBlock.reserved1  = 0;
-    initBlock.numSendBuffers = 3;    // Log2(# of send buffers) => 2^3 = 8
-    initBlock.reserved2  = 0;
-    initBlock.numRecvBuffers = 3;    // Log2(# of recv buffers) => 2^3 = 8
-    initBlock.physicalAddress = MAC; // Store MAC
-    initBlock.reserved3  = 0;
-    initBlock.logicalAddress = 0;    // No IP set yet (will be updated later)
-    
-    // Align and store the addresses of send/receive descriptor arrays
-    sendBufferDescr = (BufferDescriptor*)(
-        (((uint32_t)&sendBufferDescrMemory[0]) + 15) & ~((uint32_t)0xF)
-    );
-    initBlock.sendBufferDescrAddress = (uint32_t)sendBufferDescr;
-    
-    recvBufferDescr = (BufferDescriptor*)(
-        (((uint32_t)&recvBufferDescrMemory[0]) + 15) & ~((uint32_t)0xF)
-    );
-    initBlock.recvBufferDescrAddress = (uint32_t)recvBufferDescr;
-    
-    // Initialize each descriptor
-    for(uint8_t i = 0; i < 8; i++)
-    {
-        // Set address (aligned) for send buffers
-        sendBufferDescr[i].address = 
-            ((((uint32_t)&sendBuffers[i]) + 15 ) & ~(uint32_t)0xF);
-
-        // Descriptor flags: size, ownership bit, etc.
-        sendBufferDescr[i].flags  = 0x7FF | 0xF000;    // 0xF000 => owned by driver, 7FF => buffer size
-        sendBufferDescr[i].flags2 = 0;
-        sendBufferDescr[i].avail  = 0;
-        
-        // Set address (aligned) for receive buffers
-        recvBufferDescr[i].address = 
-            ((((uint32_t)&recvBuffers[i]) + 15 ) & ~(uint32_t)0xF);
-
-        // 0xF7FF => buffer size (2047 bytes?), 0x80000000 => owned by card
-        recvBufferDescr[i].flags = 0xF7FF | 0x80000000;
-        recvBufferDescr[i].flags2 = 0;
-        // This appears to be a minor bug: the line below uses 'sendBufferDescr[i].avail' instead of 'recvBufferDescr[i].avail'
-        sendBufferDescr[i].avail = 0;  
-    }
-    
-    // Store the lower 16 bits of initBlock address in register #1
-    registerAddressPort.Write(1);
-    registerDataPort.Write( (uint32_t)(&initBlock) & 0xFFFF );
-
-    // Store the upper 16 bits of initBlock address in register #2
-    registerAddressPort.Write(2);
-    registerDataPort.Write( ((uint32_t)(&initBlock) >> 16) & 0xFFFF );
+    this->master = master;
 }
 
 /*
- * Destructor: typically does nothing specific here.
+ * Destructor:
+ *   - Currently empty, but could be used for shutting down the drive or freeing resources.
  */
-amd_am79c973::~amd_am79c973()
+AdvancedTechnologyAttachment::~AdvancedTechnologyAttachment()
 {
 }
             
-
 /*
- * Activate:
- *  - Performs final steps to enable the card, such as turning on interrupts (Init Done) and the start command.
- *  - Bits 0x41 and 0x42 are written to Register #0 to issue START & INIT commands, etc.
+ * Identify:
+ *   - Issues the 'IDENTIFY' command (0xEC) to the drive to retrieve information such as 
+ *     model number, serial number, supported features, etc.
+ *   - First, it selects the drive (master or slave), then issues the IDENTIFY command.
+ *   - If the drive is present and supports IDENTIFY, we read 256 words (512 bytes) from the data port.
+ *   - Each word is printed out as two characters (since the model/serial info is often stored as ASCII).
+ *   - If there's an error (status=0x01), it prints "ERROR".
  */
-void amd_am79c973::Activate()
+void AdvancedTechnologyAttachment::Identify()
 {
-    // Issue START command (write 0x41 to reg #0)
-    registerAddressPort.Write(0);
-    registerDataPort.Write(0x41);
-
-    // Enable interrupts by setting bits in register #4
-    registerAddressPort.Write(4);
-    uint32_t temp = registerDataPort.Read();
-    registerAddressPort.Write(4);
-    registerDataPort.Write(temp | 0xC00);
+    // Select the drive (0xA0 for master, 0xB0 for slave) and reset any control flags
+    devicePort.Write(master ? 0xA0 : 0xB0);
+    controlPort.Write(0);
     
-    // Issue INIT command (write 0x42 to reg #0)
-    registerAddressPort.Write(0);
-    registerDataPort.Write(0x42);
-}
-
-/*
- * Reset:
- *  - Triggers a reset via resetPort by reading and then writing 0.
- *  - Returns an arbitrary integer (10), possibly used as a delay or status code.
- */
-int amd_am79c973::Reset()
-{
-    resetPort.Read();
-    resetPort.Write(0);
-    return 10;
-}
-
-
-
-/*
- * HandleInterrupt:
- *  - Invoked by the interrupt manager when the AMD NIC triggers an interrupt.
- *  - Reads the status register (#0), checks various error/status bits, and acknowledges them.
- *  - Calls Receive() if data is available or logs collisions/missed frames/etc.
- *  - Returns the stack pointer (esp) unchanged in this implementation.
- */
-uint32_t amd_am79c973::HandleInterrupt(common::uint32_t esp)
-{
-    // Read status
-    registerAddressPort.Write(0);
-    uint32_t temp = registerDataPort.Read();
+    // Read status to check if drive exists (0xFF = no drive)
+    devicePort.Write(0xA0);
+    uint8_t status = commandPort.Read();
+    if(status == 0xFF)
+        return;
     
-    if((temp & 0x8000) == 0x8000)
-        printf("AMD am79c973 ERROR\n");
-    if((temp & 0x2000) == 0x2000)
-        printf("AMD am79c973 COLLISION ERROR\n");
-    if((temp & 0x1000) == 0x1000)
-        printf("AMD am79c973 MISSED FRAME\n");
-    if((temp & 0x0800) == 0x0800)
-        printf("AMD am79c973 MEMORY ERROR\n");
-    if((temp & 0x0400) == 0x0400)
-        Receive();
-    if((temp & 0x0200) == 0x0200)
-        printf(" SENT");
-
-    // Acknowledge interrupt by writing back the status bits
-    registerAddressPort.Write(0);
-    registerDataPort.Write(temp);
+    // Prepare the drive for IDENTIFY
+    devicePort.Write(master ? 0xA0 : 0xB0);
+    sectorCountPort.Write(0);
+    lbaLowPort.Write(0);
+    lbaMidPort.Write(0);
+    lbaHiPort.Write(0);
     
-    if((temp & 0x0100) == 0x0100)
-        printf("AMD am79c973 INIT DONE\n");
+    // Issue the IDENTIFY command (0xEC)
+    commandPort.Write(0xEC);
     
-    return esp;
-}
-
-       
-/*
- * Send:
- *  - Places a packet into the next available send buffer, then signals the NIC to start transmission.
- *  - size: Number of bytes in the packet (max 1518 for Ethernet).
- *  - currentSendBuffer is used to track which descriptor to use.
- *  - The contents of 'buffer' are copied backward into the descriptor's buffer memory.
- */
-void amd_am79c973::Send(uint8_t* buffer, int size)
-{
-    int sendDescriptor = currentSendBuffer;
-    currentSendBuffer = (currentSendBuffer + 1) % 8;
+    // If the drive returns 0x00, it's not present or doesn't respond
+    status = commandPort.Read();
+    if(status == 0x00)
+        return;
     
-    if(size > 1518)
-        size = 1518;
-    
-    // Copy payload into the buffer, from end to start
-    for(uint8_t *src = buffer + size -1,
-                *dst = (uint8_t*)(sendBufferDescr[sendDescriptor].address + size -1);
-                src >= buffer; src--, dst--)
+    // Wait until BSY clears (bit 7 = 0) and DRQ sets or ERR sets (bit 0 = 1 means error).
+    while(((status & 0x80) == 0x80)  // BSY = 1
+       && ((status & 0x01) != 0x01)) // ERR = 0
     {
-        *dst = *src;
+        status = commandPort.Read();
     }
         
-    printf("\nSEND: ");
-    // Print partial contents of the packet (from byte 34 up to 64 or 'size')
-    for(int i = 14+20; i < (size>64?64:size); i++)
+    // If ERR is set (bit 0), print "ERROR"
+    if(status & 0x01)
     {
-        printfHex(buffer[i]);
-        printf(" ");
+        printf("ERROR");
+        return;
     }
     
-    // Mark descriptor as ready to send, owned by NIC, with the size set
-    sendBufferDescr[sendDescriptor].avail = 0;
-    sendBufferDescr[sendDescriptor].flags2 = 0;
-    sendBufferDescr[sendDescriptor].flags = 0x8300F000
-                                          | ((uint16_t)((-size) & 0xFFF));
-                                          
-    // Write to register #0 to notify the NIC to transmit (bit 4 = transmit demand)
-    registerAddressPort.Write(0);
-    registerDataPort.Write(0x48);
-}
-
-/*
- * Receive:
- *  - Processes all receive buffers that are marked as complete by the NIC (ownership bit cleared).
- *  - For each valid packet (flags & 0x03000000 == 0x03000000 implies good packet),
- *    prints partial data, then calls the handler->OnRawDataReceived if set.
- *  - Resets the descriptor ownership bit (0x80000000) for the NIC to reuse.
- */
-void amd_am79c973::Receive()
-{
-    printf("\nRECV: ");
-    
-    // Loop through all receive buffers until we find one still owned by the NIC (bit 31 set)
-    for(; (recvBufferDescr[currentRecvBuffer].flags & 0x80000000) == 0;
-        currentRecvBuffer = (currentRecvBuffer + 1) % 8)
+    // Read 256 words of drive info
+    for(int i = 0; i < 256; i++)
     {
-        // If it's a valid packet (not an error frame, etc.)
-        if(!(recvBufferDescr[currentRecvBuffer].flags & 0x40000000)  // no error
-         && (recvBufferDescr[currentRecvBuffer].flags & 0x03000000) == 0x03000000) // 0x03 => packet received OK
-        {
-            uint32_t size = recvBufferDescr[currentRecvBuffer].flags & 0xFFF; // Lower 12 bits = packet length
-            if(size > 64)
-                size -= 4;  // Remove checksum if size > 64
-            
-            // Pointer to the received data
-            uint8_t* buffer = (uint8_t*)(recvBufferDescr[currentRecvBuffer].address);
-
-            // Print partial contents of the received packet
-            for(int i = 14+20; i < (size>64?64:size); i++)
-            {
-                printfHex(buffer[i]);
-                printf(" ");
-            }
-
-            // If we have a handler and it returns true, we echo the packet back (for testing)
-            if(handler != 0)
-                if(handler->OnRawDataReceived(buffer, size))
-                    Send(buffer, size);
-        }
+        uint16_t data = dataPort.Read();
         
-        // Reset descriptor ownership to the NIC and restore buffer length flags
-        recvBufferDescr[currentRecvBuffer].flags2 = 0;
-        recvBufferDescr[currentRecvBuffer].flags = 0x8000F7FF;
+        // Each word is 2 bytes; interpret them as ASCII.
+        char text[3] = "  ";  // temporary buffer
+        text[0] = (data >> 8) & 0xFF;  // high byte
+        text[1] = data & 0xFF;        // low byte
+        
+        // Print the two characters
+        printf(text);
     }
+    printf("\n");
 }
 
 /*
- * SetHandler:
- *  - Allows an external RawDataHandler to be assigned for handling received packets.
+ * Read28:
+ *   - Reads a single 512-byte sector from the drive using 28-bit LBA.
+ *   - sectorNum: The sector index (0..0x0FFFFFFF).
+ *   - count: Number of bytes to read from that sector (<= 512).
+ *   - This code reads from the data port in 16-bit words and prints them out as text.
+ *   - The remainder of the 512-byte sector is read (and discarded) if 'count' < 512.
  */
-void amd_am79c973::SetHandler(RawDataHandler* handler)
+void AdvancedTechnologyAttachment::Read28(common::uint32_t sectorNum, int count)
 {
-    this->handler = handler;
+    // 28-bit LBA max
+    if(sectorNum > 0x0FFFFFFF)
+        return;
+    
+    // Select drive with LBA bits
+    devicePort.Write( (master ? 0xE0 : 0xF0) 
+                     | ((sectorNum & 0x0F000000) >> 24) );
+    
+    // Reset error register
+    errorPort.Write(0);
+    
+    // We want to read 1 sector
+    sectorCountPort.Write(1);
+    
+    // Write the low/mid/high parts of the LBA
+    lbaLowPort.Write(  sectorNum & 0x000000FF );
+    lbaMidPort.Write( (sectorNum & 0x0000FF00) >> 8 );
+    lbaLowPort.Write( (sectorNum & 0x00FF0000) >> 16 );
+
+    // Issue 'READ SECTORS' command (0x20)
+    commandPort.Write(0x20);
+    
+    // Wait for the drive to be ready (BSY=0, ERR=0)
+    uint8_t status = commandPort.Read();
+    while(((status & 0x80) == 0x80)  // BSY=1
+       && ((status & 0x01) != 0x01)) // ERR=0
+    {
+        status = commandPort.Read();
+    }
+        
+    if(status & 0x01) // Error
+    {
+        printf("ERROR");
+        return;
+    }
+    
+    
+    printf("Reading ATA Drive: ");
+    
+    // Read 'count' bytes (in words) from the data port
+    for(int i = 0; i < count; i += 2)
+    {
+        uint16_t wdata = dataPort.Read();
+        
+        // Convert the 16-bit word into two characters
+        char text[3] = "  ";
+        text[0] = wdata & 0xFF;
+        
+        if(i+1 < count)
+            text[1] = (wdata >> 8) & 0xFF;
+        else
+            text[1] = '\0'; // no second char if count is odd
+        
+        printf(text);
+    }    
+    
+    // If we haven't read the full 512 bytes, we need to discard the remainder
+    // so the drive's internal pointer is at the next sector boundary.
+    for(int i = count + (count%2); i < 512; i += 2)
+        dataPort.Read();
 }
 
 /*
- * GetMACAddress:
- *  - Returns the 48-bit MAC address stored in the initBlock.
+ * Write28:
+ *   - Writes a single 512-byte sector using 28-bit LBA.
+ *   - sectorNum: The sector index to write.
+ *   - data: Pointer to the bytes to be written.
+ *   - count: Number of bytes to write (<= 512).
+ *   - If less than 512 bytes are written, the remainder of the sector is filled with 0x00.
  */
-uint64_t amd_am79c973::GetMACAddress()
+void AdvancedTechnologyAttachment::Write28(common::uint32_t sectorNum, common::uint8_t* data, common::uint32_t count)
 {
-    return initBlock.physicalAddress;
+    // Validate LBA range and size
+    if(sectorNum > 0x0FFFFFFF)
+        return;
+    if(count > 512)
+        return;
+    
+    // Select drive and address
+    devicePort.Write( (master ? 0xE0 : 0xF0)
+                     | ((sectorNum & 0x0F000000) >> 24) );
+                     
+    errorPort.Write(0);
+    sectorCountPort.Write(1);
+
+    // LBA low/mid/high
+    lbaLowPort.Write(  sectorNum & 0x000000FF );
+    lbaMidPort.Write( (sectorNum & 0x0000FF00) >> 8 );
+    lbaLowPort.Write( (sectorNum & 0x00FF0000) >> 16 );
+
+    // Write command (0x30 = WRITE SECTORS)
+    commandPort.Write(0x30);
+    
+    printf("Writing to ATA Drive: ");
+
+    // Write the 'count' bytes, two bytes at a time
+    for(int i = 0; i < (int)count; i += 2)
+    {
+        uint16_t wdata = data[i];
+        if(i+1 < (int)count)
+            wdata |= ((uint16_t)data[i+1]) << 8;
+        
+        dataPort.Write(wdata);
+        
+        // Print what we wrote
+        char text[3] = "  ";
+        text[0] = (wdata >> 8) & 0xFF;
+        text[1] = wdata & 0xFF;
+        printf(text);
+    }
+    
+    // If the buffer is shorter than 512 bytes, pad the rest of the sector with 0.
+    for(int i = count + (count%2); i < 512; i += 2)
+        dataPort.Write(0x0000);
 }
 
 /*
- * SetIPAddress:
- *  - Sets the logical IP address in the initBlock.
- *  - This is typically used for higher-layer protocols (ARP, IPv4) that query the NIC’s IP.
+ * Flush:
+ *   - Issues the 'FLUSH CACHE' command (0xE7) to ensure any data cached by the drive is written to disk.
+ *   - Waits for BSY=0 and checks ERR. If an error is encountered, prints "ERROR".
  */
-void amd_am79c973::SetIPAddress(uint32_t ip)
+void AdvancedTechnologyAttachment::Flush()
 {
-    initBlock.logicalAddress = ip;
-}
+    // Select drive
+    devicePort.Write( master ? 0xE0 : 0xF0 );
+    
+    // FLUSH CACHE command
+    commandPort.Write(0xE7);
 
-/*
- * GetIPAddress:
- *  - Returns the logical IP address stored in the initBlock.
- */
-uint32_t amd_am79c973::GetIPAddress()
-{
-    return initBlock.logicalAddress;
+    uint8_t status = commandPort.Read();
+    if(status == 0x00)
+        return;
+    
+    // Wait until BSY=0 or ERR=1
+    while(((status & 0x80) == 0x80)  // BSY=1
+       && ((status & 0x01) != 0x01)) // ERR=0
+    {
+        status = commandPort.Read();
+    }
+        
+    if(status & 0x01) // ERR
+    {
+        printf("ERROR");
+        return;
+    }
 }
